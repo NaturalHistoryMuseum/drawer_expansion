@@ -1,4 +1,5 @@
 import cv2
+import os
 import numpy as np
 import pandas as pd
 from shapely.geometry import box
@@ -45,16 +46,15 @@ def compute_area_box(bbox, image_width, image_height):
     return (x_max - x_min) * (y_max - y_min)
 
 def is_unit_tray_drawer(bboxes):
-    if (5 in bboxes['class_label_number'].values):
-        return True
-    else:
-        return False
+    return 5 in bboxes['class_label_number'].values
+
+def is_drawer(bboxes):
+    return 4 in bboxes['class_label_number'].values
 
 def is_rehoused(bboxes):
-    if len(bboxes[bboxes['class_label_number'] == 1])/len(bboxes[bboxes['class_label_number'] == 2]) > 0.8:
-        return True
-    else:
-        return False
+    count_class_1 = len(bboxes[bboxes['class_label_number'] == 1])
+    count_class_2 = len(bboxes[bboxes['class_label_number'] == 10])
+    return count_class_1 / count_class_2 > 0.8 if count_class_2 > 0 else False
 
 def euclidean_distance(point1, point2):
     """
@@ -135,7 +135,7 @@ def process_specimens_and_labels(specimen_bboxes, label_bboxes):
         # Get the nearest label and its distance
         nearest_label_bbox, nearest_label_bbox_index, distance = find_nearest_label(specimen_bbox, label_bboxes)
 
-        if not nearest_label_bbox.empty:
+        if nearest_label_bbox is not None and not nearest_label_bbox.empty:
             specimen_data.append({
                 'specimen_index': index,
                 'specimen_bbox': specimen_bbox[fieldnames],  # Keep only required fields
@@ -411,12 +411,14 @@ def process_specimens_and_barcodes(specimen_bboxes, barcode_bboxes):
 
     Returns:
     - List of dictionaries with specimen, barcode, and bounding box information.
+    - DataFrame of unpaired specimen bounding boxes.
     """
     if specimen_bboxes.empty or barcode_bboxes.empty:
-        return []  # Return empty list if no valid data
+        return [], specimen_bboxes  # Return empty list and the original DataFrame if no valid data
 
     results = []
     barcode_assignments = find_nearest_specimen_for_barcodes(specimen_bboxes, barcode_bboxes)
+    paired_specimens = set(barcode_assignments.values())
 
     for b_idx, s_idx in barcode_assignments.items():
         specimen_bbox = specimen_bboxes.loc[s_idx]
@@ -448,7 +450,9 @@ def process_specimens_and_barcodes(specimen_bboxes, barcode_bboxes):
             'larger_bbox': larger_bbox
         })
 
-    return results
+    unpaired_specimens = specimen_bboxes.loc[~specimen_bboxes.index.isin(paired_specimens)]
+
+    return results, unpaired_specimens
 
 def analyze_unit_tray_occupancy(merged_df, unit_tray_bboxes, image_width, image_height, full_threshold=0.8):
     """
@@ -495,37 +499,26 @@ def analyze_unit_tray_occupancy(merged_df, unit_tray_bboxes, image_width, image_
 
     return pd.DataFrame(results)
 
-# Define function to process each CSV
-def process_drawer_data(csv_path, image_dir, output_dir_aim2, output_dir_aim3):
+# Aim 1: Current occupancy estimate
+def run_aim1(bboxes, image_width, image_height):
     """
-    Process a single CSV file and generate AIM2 and AIM3 results.
+    Current occupancy estimate:
+    1. Calculate the total sum of meta bounding box areas.We call this B.
+    2. Calculate the total drawer area (these are of standard sizes, S, 
+    so just the standard size area multiplied by the total number of drawers, N). 
+    Call this sum SN.
+    3. Compute the percentage of the area filled, (B/SN)*100
 
     Parameters:
-    - csv_path: Path to the CSV file.
-    - image_dir: Directory containing images.
-    - output_dir_aim2: Directory to save AIM2 results.
-    - output_dir_aim3: Directory to save AIM3 results.
+    - bboxes: DataFrame containing bounding box information.
+    - image_width: Width of the image (for coordinate scaling).
+    - image_height: Height of the image (for coordinate scaling).
+
+    Returns:
+    Dataframe containing the bounding boxes inside the drawer.
     """
 
-    # Extract filename (without extension) to find corresponding image
-    filename = os.path.splitext(os.path.basename(csv_path))[0]
-    
-    # Construct image path
-    image_path = os.path.join(image_dir, f"{filename}.jpeg")  # Adjust extension if needed
-
-    # Load the image
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Image not found: {image_path}")
-        return
-
-    # Get image dimensions
-    image_height, image_width, _ = image.shape
-
-    # Load bounding box data
-    bboxes = pd.read_csv(csv_path)
-
-    # Extract different class bounding boxes
+    # Load all meta the bounding boxes
     specimen_bboxes = bboxes[bboxes['class_label_number'] == 0]
     barcode_bboxes = bboxes[bboxes['class_label_number'] == 1]
     label_bboxes = bboxes[bboxes['class_label_number'] == 2]
@@ -533,95 +526,183 @@ def process_drawer_data(csv_path, image_dir, output_dir_aim2, output_dir_aim3):
     drawer_bboxes = bboxes[bboxes['class_label_number'] == 4]
     unit_tray_bboxes = bboxes[bboxes['class_label_number'] == 5]
 
-    # Aim 1: Current occupancy estimate
+    # Process the specimens and labels
     results, unpaired_specimens, unpaired_labels = process_specimens_and_labels(specimen_bboxes, label_bboxes)
+
+    # Bounding boxes from the results
     bounding_boxes = [result['larger_bbox'] for result in results]
-    bounding_boxes_df = convert_to_dataframe(bounding_boxes, 0)
-    
-    # Convert unpaired to DataFrames
+    bounding_boxes_df = convert_to_dataframe(bounding_boxes, 0) # Set class label to be specimen
+
+    # Convert unpaired_specimens and unpaired_labels to DataFrames
     unpaired_specimens_df = pd.DataFrame(unpaired_specimens)
     unpaired_labels_df = pd.DataFrame(unpaired_labels)
-    
-    # Merge bounding boxes
+
+    # Merge all DataFrames
     merged_df = pd.concat([bounding_boxes_df, unpaired_specimens_df, unpaired_labels_df, barcode_bboxes, note_bboxes], ignore_index=True)
-    
-    # Filter by drawer
+
     occupancy_df = filter_bboxes_inside_drawer(merged_df, drawer_bboxes)
 
     # Compute total non-overlapping area
     total_area = compute_total_non_overlapping_area(occupancy_df, image_width, image_height)
 
-    # Aim 2: Specimen expansion with barcode
+    """
+    # Display the detection details
+    print("The drawer is rehoused: ", is_rehoused(bboxes))
+    print("The drawer is a unit tray drawer: ", is_unit_tray_drawer(bboxes))
+    print("Number of specimens: ", len(specimen_bboxes))
+    print("Number of barcode_bboxes boxes: ", len(barcode_bboxes))
+    print("Number of notes boxes: ", len(note_bboxes))
+    print("Number of label boxes: ", len(label_bboxes))
+    print("Number of drawer boxes: ", len(drawer_bboxes))
+    print("Number of paired bounding boxes: ", len(bounding_boxes))
+    print("Number of unpaired_specimens boxes: ", len(unpaired_specimens))
+    print("Number of unpaired_labels boxes: ", len(unpaired_labels))
+    print("Number of aim1 bounding boxes: ", len(occupancy_df))
+    """
+    return occupancy_df, total_area, unit_tray_bboxes
+    
+# Aim 2: Specimen expansion with barcode
+def run_aim2(occupancy_df, image_width, image_height):
+    """
+    Aim 2: Specimen expansion with barcode
+
+    1. Filter the dataset to only include specimens that had a barcode found.
+    2. Compute the total area of the specimen bounding boxes. We call this A
+    3. Compute the total area of the specimen bounding boxes with the barcode removed. 
+    This will be A0
+    4. Compute percentage difference: (A0-A)/A0. [E.g., if the area excluding the barcode was 50, 
+    and the area including the barcode was 55, you’d get 0.1 (a 10% increase).
+    """
+    # Update class_label_number: Change 0 and 2 to 10
     occupancy_df.loc[occupancy_df['class_label_number'].isin([0, 2]), 'class_label_number'] = 10
     occupancy_bboxes = occupancy_df[occupancy_df['class_label_number'] == 10]
-    
-    aim2_results = process_specimens_and_barcodes(occupancy_bboxes, barcode_bboxes)
+    barcode_bboxes = occupancy_df[occupancy_df['class_label_number'] == 1]
+
+    aim2_results, unpaired_occupancy = process_specimens_and_barcodes(occupancy_bboxes, barcode_bboxes)
     aim2_bounding_boxes = [result['larger_bbox'] for result in aim2_results]
     aim2_specimen_bboxes = [result['specimen_bbox'] for result in aim2_results]
-    aim2_specimen_bboxes_df = pd.DataFrame(aim2_specimen_bboxes)
+    aim2_specimen_bboxes = pd.DataFrame(aim2_specimen_bboxes)
     aim2_bounding_boxes_df = convert_to_dataframe(aim2_bounding_boxes, 11)
-    
-    # Compute areas
+
     aim2_A0 = compute_total_non_overlapping_area(aim2_bounding_boxes_df, image_width, image_height)
-    aim2_A = compute_total_non_overlapping_area(aim2_specimen_bboxes_df, image_width, image_height)
+    aim2_A = compute_total_non_overlapping_area(aim2_specimen_bboxes, image_width, image_height)
+    aim2_unpaired_occupancy_area = compute_total_non_overlapping_area(unpaired_occupancy, image_width, image_height)
 
-    # Merge Aim 2 results
-    aim2_df = pd.concat([aim2_specimen_bboxes_df, aim2_bounding_boxes_df], ignore_index=True)
-
-    # Save Aim 2 results
-    aim2_output_path = os.path.join(output_dir_aim2, f"{filename}.csv")
-    aim2_df.to_csv(aim2_output_path, index=False)
-    print(f"AIM2 saved: {aim2_output_path}")
-
-    # Aim 3: Calculate mean occupancy of unit trays
-    if is_unit_tray_drawer(occupancy_df):
-        unit_tray_occupancy_df = analyze_unit_tray_occupancy(occupancy_df, unit_tray_bboxes, image_width, image_height)
+    # Merge all DataFrames
+    if unpaired_occupancy is None or unpaired_occupancy.empty:
+        aim2_unpaired_occupancy_df = pd.DataFrame()
+    else:
+        aim2_unpaired_occupancy_df = pd.DataFrame(unpaired_occupancy)
+        aim2_unpaired_occupancy_df['class_label_number'] = 12  # Assign label
+    aim2_df = pd.concat([aim2_specimen_bboxes, aim2_bounding_boxes_df, aim2_unpaired_occupancy_df], ignore_index=True)
+    # Prevent division by zero in aim2_expansion_percentage
+    if aim2_A == 0:
+        aim2_expansion_percentage = 0
+    else:
+        aim2_expansion_percentage = (aim2_A0 - aim2_A) / aim2_A
     
-        # Merge unit tray occupancy info
-        unit_tray_bboxes = unit_tray_bboxes.reset_index()
-        merged_unit_trays_df = unit_tray_bboxes.merge(
-            unit_tray_occupancy_df, 
-            left_index=True, 
-            right_on="unit_tray_index", 
-            how="left"
-        ).drop(columns=["unit_tray_index"])
-    
-        merged_unit_trays_df = merged_unit_trays_df.set_index("index")
-    
-        # Merge all Aim 3 data
-        aim3_df = pd.concat([occupancy_df, drawer_bboxes, merged_unit_trays_df], ignore_index=True)
+    is_rehoused_boolean = is_rehoused(occupancy_df)
 
-    # Save Aim 3 results
-    aim3_output_path = os.path.join(output_dir_aim3, f"{filename}.csv")
-    aim3_df.to_csv(aim3_output_path, index=False)
-    print(f"AIM3 saved: {aim3_output_path}")
-
-# Main function to process all CSVs in a directory
-def process_all_drawers(image_dir, csv_dir, output_dir_aim2, output_dir_aim3):
     """
-    Process all CSV files in the given directory.
-
-    Parameters:
-    - image_dir: Directory containing images.
-    - csv_dir: Directory containing CSV files.
-    - output_dir_aim2: Directory to save AIM2 results.
-    - output_dir_aim3: Directory to save AIM3 results.
+    # Display the detection details
+    print("Number of occupancy: ", len(occupancy_bboxes))
+    print("Number of barcodes: ", len(barcode_bboxes))
+    print("Number of aim2 bounding boxes: ", len(aim2_bounding_boxes))
+    print("Number of filtered_occupancy_df boxes: ", len(aim2_specimen_bboxes))
+    print("Total expansion percentage difference: ", aim2_expansion_percentage)
+    print("Total unpaired occupancy area: ", aim2_unpaired_occupancy_area)
+    print("Total aim2_A0: ", aim2_A0)
+    print("Total aim2_A: ", aim2_A)
     """
+
+    return aim2_df, aim2_expansion_percentage, aim2_unpaired_occupancy_area, is_rehoused_boolean
+
+def run_aim1_aim2(image_path, csv_path, drawer_averages_path):
+    # Load the original image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Image not found at {image_path}")
+    
+    # Get the image's width and height
+    image_height, image_width, _ = image.shape
+    
+    # Load the bounding boxes from the CSV file
+    bboxes = pd.read_csv(csv_path)
+    
+    # Check if the drawer exists in the current CSV, otherwise load from averages
+    if is_drawer(bboxes):
+        drawer_bboxes = bboxes[bboxes['class_label_number'] == 4]
+    else:
+        drawer_bboxes = pd.read_csv(drawer_averages_path)
+    
+    drawer_area_normalised = compute_area(drawer_bboxes.iloc[0])
+    
+    # Compute note box total non-overlapping area
+    note_bboxes = bboxes[bboxes['class_label_number'] == 3]
+    note_area_total = compute_total_non_overlapping_area(note_bboxes, image_width, image_height)
+    
+    # Compute drawer box area
+    drawer_box_area = compute_area_box(drawer_bboxes.iloc[0], image_width, image_height)
+
+    # Aim 1: Current occupancy estimate
+    occupancy_df, total_area, unit_tray_bboxes = run_aim1(bboxes, image_width, image_height)
+    
+    # Aim 2: Specimen expansion with barcode
+    aim2_df, aim2_expansion_percentage, aim2_unpaired_occupancy_area, is_rehoused_boolean = run_aim2(occupancy_df, image_width, image_height)
+    
+    # Merge all DataFrames
+    drawer_bboxes = pd.DataFrame(drawer_bboxes)
+    result = pd.concat([occupancy_df, aim2_df, drawer_bboxes, unit_tray_bboxes], ignore_index=True)
+    
+    # Create new dataframe for key metrics
+    result2 = pd.DataFrame({
+        'filename': [os.path.splitext(os.path.basename(csv_path))[0]],
+        'drawer_area_normalised': [drawer_area_normalised],
+        'total_area': [total_area],
+        'aim2_expansion_percentage': [aim2_expansion_percentage],
+        'aim2_unpaired_occupancy_area': [aim2_unpaired_occupancy_area],
+        'is_rehoused_boolean': [is_rehoused_boolean],
+        'image_width': [image_width],
+        'image_height': [image_height],
+        'note_area_total': [note_area_total],
+        'drawer_box_area': [drawer_box_area]
+    })
+    
+    return result, result2
+
+def process_all_drawers(image_directory, csv_directory, output_directory1, output_directory2, drawer_averages_path):
     # Ensure output directories exist
-    os.makedirs(output_dir_aim2, exist_ok=True)
-    os.makedirs(output_dir_aim3, exist_ok=True)
+    os.makedirs(output_directory1, exist_ok=True)
+    os.makedirs(output_directory2, exist_ok=True)
+    
+    all_results = []
+    
+    for csv_file in os.listdir(csv_directory):
+        if csv_file.endswith(".csv"):
+            csv_path = os.path.join(csv_directory, csv_file)
+            image_path = os.path.join(image_directory, os.path.splitext(csv_file)[0] + ".jpeg")  # Assuming images are .jpg
+            
+            if os.path.exists(image_path):
+                result, result2 = run_aim1_aim2(image_path, csv_path, drawer_averages_path)
+                
+                # Save individual results to output directory 1
+                result.to_csv(os.path.join(output_directory1, csv_file), index=False)
+                
+                # Append to aggregate results
+                all_results.append(result2)
+    
+    # Combine all result2 DataFrames and save to output directory 2
+    final_results_df = pd.concat(all_results, ignore_index=True)
+    final_results_df.to_csv(os.path.join(output_directory2, "aggregated_results.csv"), index=False)
 
-    # Loop through CSV files in the directory
-    for csv_filename in os.listdir(csv_dir):
-        if csv_filename.endswith(".csv"):  # Process only CSV files
-            csv_path = os.path.join(csv_dir, csv_filename)
-            process_drawer_data(csv_path, image_dir, output_dir_aim2, output_dir_aim3)
-
-# Example usage (Modify with actual paths)
+# Define directories
 image_directory = "/Users/mbax9qg2/Downloads/training_data/source/"
-csv_directory = "/Users/mbax9qg2/Downloads/processed/"
-output_directory_aim2 = "/Users/mbax9qg2/Downloads/processed/aim2/"
-output_directory_aim3 = "/Users/mbax9qg2/Downloads/processed/aim3/"
+csv_directory = "/Users/mbax9qg2/Downloads/processed/test"
+drawer_averages_path = "/Users/mbax9qg2/Downloads/drawer/drawer_averages.csv"
+output_directory1 = "/Users/mbax9qg2/Downloads/processed/aim12/"
+output_directory2 = "/Users/mbax9qg2/Downloads/processed/aim12_aggregated/"
 
 # Run the script
-process_all_drawers(image_directory, csv_directory, output_directory_aim2, output_directory_aim3)
+print("Processing...")
+process_all_drawers(image_directory, csv_directory, output_directory1, output_directory2, drawer_averages_path)
+print("Processing complete.")

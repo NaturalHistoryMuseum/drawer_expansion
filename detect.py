@@ -44,16 +44,15 @@ def compute_area_box(bbox, image_width, image_height):
     return (x_max - x_min) * (y_max - y_min)
 
 def is_unit_tray_drawer(bboxes):
-    if (5 in bboxes['class_label_number'].values):
-        return True
-    else:
-        return False
+    return 5 in bboxes['class_label_number'].values
+
+def is_drawer(bboxes):
+    return 4 in bboxes['class_label_number'].values
 
 def is_rehoused(bboxes):
-    if len(bboxes[bboxes['class_label_number'] == 1])/len(bboxes[bboxes['class_label_number'] == 2]) > 0.8:
-        return True
-    else:
-        return False
+    count_class_1 = len(bboxes[bboxes['class_label_number'] == 1])
+    count_class_2 = len(bboxes[bboxes['class_label_number'] == 10])
+    return count_class_1 / count_class_2 > 0.8 if count_class_2 > 0 else False
 
 def euclidean_distance(point1, point2):
     """
@@ -134,7 +133,7 @@ def process_specimens_and_labels(specimen_bboxes, label_bboxes):
         # Get the nearest label and its distance
         nearest_label_bbox, nearest_label_bbox_index, distance = find_nearest_label(specimen_bbox, label_bboxes)
 
-        if not nearest_label_bbox.empty:
+        if nearest_label_bbox is not None and not nearest_label_bbox.empty:
             specimen_data.append({
                 'specimen_index': index,
                 'specimen_bbox': specimen_bbox[fieldnames],  # Keep only required fields
@@ -410,12 +409,15 @@ def process_specimens_and_barcodes(specimen_bboxes, barcode_bboxes):
 
     Returns:
     - List of dictionaries with specimen, barcode, and bounding box information.
+    - DataFrame of unpaired specimen bounding boxes.
     """
     if specimen_bboxes.empty or barcode_bboxes.empty:
-        return []  # Return empty list if no valid data
+        return [], specimen_bboxes  # Return empty list and the original DataFrame if no valid data
 
     results = []
     barcode_assignments = find_nearest_specimen_for_barcodes(specimen_bboxes, barcode_bboxes)
+    paired_specimens = set(barcode_assignments.values())
+    skipped_specimens = set()  # Track specimens that were skipped due to size constraints
 
     for b_idx, s_idx in barcode_assignments.items():
         specimen_bbox = specimen_bboxes.loc[s_idx]
@@ -433,21 +435,28 @@ def process_specimens_and_barcodes(specimen_bboxes, barcode_bboxes):
 
         # Check if the larger bounding box exceeds 1.5x the specimen size
         if larger_width > 1.5 * specimen_width or larger_height > 1.5 * specimen_height:
+            skipped_specimens.add(s_idx)
             continue  # Skip this match
 
         # Compute areas for reference
         specimen_area = compute_area(specimen_bbox)
-        barcode_area = compute_area(nearest_barcode_bbox)  
+        barcode_area = compute_area(nearest_barcode_bbox)
+        larger_bbox_area = larger_width * larger_height
 
         results.append({
             'specimen_bbox': specimen_bbox.to_dict(),  # Ensure dictionary format
             'specimen_area': specimen_area,
             'nearest_barcode_bbox': nearest_barcode_bbox.to_dict(),
             'barcode_area': barcode_area,
-            'larger_bbox': larger_bbox
+            'larger_bbox': larger_bbox,
+            'larger_bbox_area': larger_bbox_area
         })
 
-    return results
+    # Identify unpaired specimens (those that were never assigned or were skipped)
+    all_specimen_indices = set(specimen_bboxes.index)
+    unpaired_specimens = specimen_bboxes.loc[~specimen_bboxes.index.isin(paired_specimens - skipped_specimens)]
+
+    return results, unpaired_specimens
 
 def analyze_unit_tray_occupancy(merged_df, unit_tray_bboxes, image_width, image_height, full_threshold=0.8):
     """
@@ -494,153 +503,459 @@ def analyze_unit_tray_occupancy(merged_df, unit_tray_bboxes, image_width, image_
 
     return pd.DataFrame(results)
 
+def compute_occupancy_areas(occupancy_df, image_width, image_height):
+    """
+    Compute both:
+    1. Total non-overlapping area of all occupancy bounding boxes.
+    2. Overlapping area for each occupancy bounding box with all others (indexed by original DataFrame index).
+
+    Parameters:
+    - occupancy_df: Pandas DataFrame with bounding boxes (filtered where class_label_number == 10).
+    - image_width: Width of the image (to convert normalized coordinates).
+    - image_height: Height of the image (to convert normalized coordinates).
+
+    Returns:
+    - total_non_overlapping_area: Total unique area covered by occupancy bounding boxes.
+    - overlapping_areas: Dictionary mapping original DataFrame index to overlapping area.
+    """
+
+    # Filter occupancy bounding boxes (already done before calling this function)
+    occupancy_bboxes = occupancy_df[occupancy_df['class_label_number'].isin([11, 12])]
+    print(f"Number of occupancy bounding boxes: {len(occupancy_bboxes)}")
+
+    # Print all class_label_number values in occupancy_df before filtering
+    print("All class_label_number values in occupancy_df:", occupancy_df["class_label_number"].unique())
+
+    if occupancy_bboxes is None or occupancy_bboxes.empty:  # Handle case where there are no occupancy boxes
+        return 0, {}
+
+    polygons = {}
+    
+    # Convert normalized coordinates to pixel-based bounding boxes and track original index
+    for idx, row in occupancy_bboxes.iterrows():
+        x_min = row['normalized_top_left_x'] * image_width
+        y_min = row['normalized_top_left_y'] * image_height
+        x_max = row['normalized_bottom_right_x'] * image_width
+        y_max = row['normalized_bottom_right_y'] * image_height
+        polygons[idx] = box(x_min, y_min, x_max, y_max)  # Store using original DataFrame index
+        # Print each bounding box area
+        print(f"Bounding box at index {idx} has area: {polygons[idx].area}")
+
+    # Check if any valid polygons exist before calling `unary_union`
+    if not polygons:
+        print("No valid bounding boxes found!")
+        return 0, {}
+
+    # Compute total non-overlapping area (union of all occupancy bounding boxes)
+    total_non_overlapping_area = unary_union(list(polygons.values())).area
+
+    # Compute overlapping area for each bounding box
+    overlapping_areas = {}
+    for idx in polygons:
+        overlap_area = sum(polygons[idx].intersection(p).area for j, p in polygons.items() if idx != j)
+        overlapping_areas[idx] = overlap_area
+        print(f"Bounding box at index {idx} has overlapping area: {overlap_area}")
+    
+
+    return total_non_overlapping_area, overlapping_areas
+
+def check_box_within_unit_tray(box, unit_tray_bboxes):
+    """
+    Check if a bounding box is inside any unit tray.
+
+    Parameters:
+    - box: A single bounding box (dictionary or Pandas row).
+    - unit_tray_bboxes: DataFrame containing unit tray bounding boxes.
+
+    Returns:
+    - (boolean, unit_tray_index): 
+      - True if the box is inside a unit tray, otherwise False.
+      - The original index of the matching unit tray (or None if not inside any tray).
+    """
+
+    for idx, unit_tray in unit_tray_bboxes.iterrows():
+        # Get unit tray boundaries (normalized coordinates)
+        tray_x_min = unit_tray['normalized_top_left_x']
+        tray_y_min = unit_tray['normalized_top_left_y']
+        tray_x_max = unit_tray['normalized_bottom_right_x']
+        tray_y_max = unit_tray['normalized_bottom_right_y']
+
+        # Get box coordinates
+        box_x_min = box['normalized_top_left_x']
+        box_y_min = box['normalized_top_left_y']
+        box_x_max = box['normalized_bottom_right_x']
+        box_y_max = box['normalized_bottom_right_y']
+
+        # Check if box is completely inside the unit tray
+        if (box_x_min >= tray_x_min and 
+            box_y_min >= tray_y_min and 
+            box_x_max <= tray_x_max and 
+            box_y_max <= tray_y_max):
+            return True, idx  # Found a match, return True with tray index
+    
+    return False, None  # Not inside any unit tray
+
+def analyse_unit_tray_occupancy_optimised(merged_df, unit_tray_bboxes, image_width, image_height, full_threshold=0.8):
+    """
+    Efficiently analyze each unit tray's occupancy:
+    1. Identify which bounding boxes belong to which unit tray.
+    2. Calculate the non-overlapping specimen area for each tray.
+    3. Determine whether the unit tray is full.
+
+    Parameters:
+    - merged_df: DataFrame of all bounding boxes.
+    - unit_tray_bboxes: DataFrame of unit tray bounding boxes.
+    - image_width: Image width (for coordinate conversion).
+    - image_height: Image height (for coordinate conversion).
+    - full_threshold: Percentage threshold to consider the tray as full (default=80%).
+
+    Returns:
+    - DataFrame with unit tray index, non-overlapping area, and occupancy status.
+    """
+    # Assign each box to a unit tray (if applicable)
+    merged_df = merged_df.copy()
+    merged_df[['is_in_unit_tray', 'unit_tray_index']] = merged_df.apply(
+        lambda row: pd.Series(check_box_within_unit_tray(row, unit_tray_bboxes)), axis=1)
+
+    # Filter only the boxes that belong to a unit tray
+    filtered_df = merged_df[merged_df['is_in_unit_tray'] == True]
+
+    # Initialize results list
+    results = []
+
+    # Group by unit tray index for efficient processing
+    for idx, tray_bbox in unit_tray_bboxes.iterrows():
+        # Get all bounding boxes assigned to this unit tray
+        tray_bboxes = filtered_df[filtered_df['unit_tray_index'] == idx]
+
+        # Compute non-overlapping specimen area
+        non_overlapping_area = compute_total_non_overlapping_area(tray_bboxes, image_width, image_height)
+
+        # Compute non-overlapping area for class_label_number == 11
+        tray_bboxes_11 = tray_bboxes[tray_bboxes['class_label_number'] == 11]
+        non_overlapping_area_11 = compute_total_non_overlapping_area(tray_bboxes_11, image_width, image_height)
+
+        # Compute non-overlapping area for class_label_number == 12
+        tray_bboxes_12 = tray_bboxes[tray_bboxes['class_label_number'] == 12]
+        non_overlapping_area_12 = compute_total_non_overlapping_area(tray_bboxes_12, image_width, image_height)
+
+        # Compute unit tray area
+        tray_area = compute_area_box(tray_bbox, image_width, image_height)
+
+        # Determine if the unit tray is full
+        occupancy_ratio = non_overlapping_area / tray_area if tray_area > 0 else 0
+        occupancy_ratio_11 = non_overlapping_area_11 / tray_area if tray_area > 0 else 0
+        occupancy_ratio_12 = non_overlapping_area_12 / tray_area if tray_area > 0 else 0
+        is_full = occupancy_ratio >= full_threshold
+
+        # Store results
+        results.append({
+            'unit_tray_index': idx,
+            'non_overlapping_specimen_area': non_overlapping_area,
+            'non_overlapping_specimen_area_11': non_overlapping_area_11,
+            'non_overlapping_specimen_area_12': non_overlapping_area_12,
+            'unit_tray_area': tray_area,
+            'occupancy_ratio': occupancy_ratio,
+            'occupancy_ratio_11': occupancy_ratio_11,
+            'occupancy_ratio_12': occupancy_ratio_12,
+            'is_full': is_full
+        })
+
+    return merged_df, pd.DataFrame(results)
+
 # Aim 1: Current occupancy estimate
+def run_aim1(bboxes, image_width, image_height):
+    """
+    Current occupancy estimate:
+    1. Calculate the total sum of meta bounding box areas.We call this B.
+    2. Calculate the total drawer area (these are of standard sizes, S, 
+    so just the standard size area multiplied by the total number of drawers, N). 
+    Call this sum SN.
+    3. Compute the percentage of the area filled, (B/SN)*100
 
-# Load the original image
-# image_path = '/Users/mbax9qg2/Downloads/drawer/example1.jpeg'  # Replace with your image path
-image_path = '/Users/mbax9qg2/Downloads/training_data/source/014533675_final.2500x13036.jpeg'
-image = cv2.imread(image_path)
-# Check if the image was loaded successfully
-if image is None:
-    raise FileNotFoundError(f"Image not found at {image_path}")
+    Parameters:
+    - bboxes: DataFrame containing bounding box information.
+    - image_width: Width of the image (for coordinate scaling).
+    - image_height: Height of the image (for coordinate scaling).
 
-# Get the image's width and height
-image_height, image_width, _ = image.shape  # _ is the number of color channels (ignored)
-print(image_height)
-print(image_width)
-# Load all meta the bounding boxes
-# bboxes = pd.read_csv('/Users/mbax9qg2/Downloads/drawer/test_detection_results_0.csv')
-bboxes = pd.read_csv('/Users/mbax9qg2/Downloads/processed/merged_detection_results.csv')
-specimen_bboxes = bboxes[bboxes['class_label_number'] == 0]
-barcode_bboxes = bboxes[bboxes['class_label_number'] == 1]
-label_bboxes = bboxes[bboxes['class_label_number'] == 2]
-note_bboxes = bboxes[bboxes['class_label_number'] == 3]
-drawer_bboxes = bboxes[bboxes['class_label_number'] == 4]
-unit_tray_bboxes = bboxes[bboxes['class_label_number'] == 5]
+    Returns:
+    Dataframe containing the bounding boxes inside the drawer.
+    """
 
-# Process the specimens and labels
-results, unpaired_specimens, unpaired_labels = process_specimens_and_labels(specimen_bboxes, label_bboxes)
+    # Load all meta the bounding boxes
+    specimen_bboxes = bboxes[bboxes['class_label_number'] == 0]
+    barcode_bboxes = bboxes[bboxes['class_label_number'] == 1]
+    label_bboxes = bboxes[bboxes['class_label_number'] == 2]
+    note_bboxes = bboxes[bboxes['class_label_number'] == 3]
+    drawer_bboxes = bboxes[bboxes['class_label_number'] == 4]
+    unit_tray_bboxes = bboxes[bboxes['class_label_number'] == 5]
 
-# Bounding boxes from the results
-bounding_boxes = [result['larger_bbox'] for result in results]
-bounding_boxes_df = convert_to_dataframe(bounding_boxes, 0)
+    # Process the specimens and labels
+    results, unpaired_specimens, unpaired_labels = process_specimens_and_labels(specimen_bboxes, label_bboxes)
 
-# Convert unpaired_specimens and unpaired_labels to DataFrames
-unpaired_specimens_df = pd.DataFrame(unpaired_specimens)
-unpaired_labels_df = pd.DataFrame(unpaired_labels)
+    # Bounding boxes from the results
+    bounding_boxes = [result['larger_bbox'] for result in results]
+    bounding_boxes_df = convert_to_dataframe(bounding_boxes, 0) # Set class label to be specimen
 
-# Merge all DataFrames
-merged_df = pd.concat([bounding_boxes_df, unpaired_specimens_df, unpaired_labels_df, barcode_bboxes, note_bboxes], ignore_index=True)
+    # Convert unpaired_specimens and unpaired_labels to DataFrames
+    unpaired_specimens_df = pd.DataFrame(unpaired_specimens)
+    unpaired_labels_df = pd.DataFrame(unpaired_labels)
 
-occupancy_df = filter_bboxes_inside_drawer(merged_df, drawer_bboxes)
+    # Merge all DataFrames
+    merged_df = pd.concat([bounding_boxes_df, unpaired_specimens_df, unpaired_labels_df, barcode_bboxes, note_bboxes], ignore_index=True)
 
-# Compute total non-overlapping area
-total_area = compute_total_non_overlapping_area(occupancy_df, image_width, image_height)
-"""
-# Display the detection details
-print("The drawer is rehoused: ", is_rehoused(bboxes))
-print("The drawer is a unit tray drawer: ", is_unit_tray_drawer(bboxes))
-print("Number of specimens: ", len(specimen_bboxes))
-print("Number of paired bounding boxes: ", len(bounding_boxes))
-print("Number of unpaired_specimens boxes: ", len(unpaired_specimens))
-print("Number of unpaired_labels boxes: ", len(unpaired_labels))
-print("Number of aim1 bounding boxes: ", len(occupancy_df))
-print("Total non-overlapping area: ", total_area)
-"""
+    occupancy_df = filter_bboxes_inside_drawer(merged_df, drawer_bboxes)
+
+    # Compute total non-overlapping area
+    total_area = compute_total_non_overlapping_area(occupancy_df, image_width, image_height)
+
+    """
+    # Display the detection details
+    print("The drawer is rehoused: ", is_rehoused(bboxes))
+    print("The drawer is a unit tray drawer: ", is_unit_tray_drawer(bboxes))
+    print("Number of specimens: ", len(specimen_bboxes))
+    print("Number of barcode_bboxes boxes: ", len(barcode_bboxes))
+    print("Number of notes boxes: ", len(note_bboxes))
+    print("Number of label boxes: ", len(label_bboxes))
+    print("Number of drawer boxes: ", len(drawer_bboxes))
+    print("Number of paired bounding boxes: ", len(bounding_boxes))
+    print("Number of unpaired_specimens boxes: ", len(unpaired_specimens))
+    print("Number of unpaired_labels boxes: ", len(unpaired_labels))
+    print("Number of aim1 bounding boxes: ", len(occupancy_df))
+    """
+    return occupancy_df, total_area, unit_tray_bboxes
+    
 # Aim 2: Specimen expansion with barcode
+def run_aim2(occupancy_df, image_width, image_height):
+    """
+    Aim 2: Specimen expansion with barcode
 
-# Update class_label_number: Change 0 and 2 to 10
-occupancy_df.loc[occupancy_df['class_label_number'].isin([0, 2]), 'class_label_number'] = 10
-occupancy_bboxes = occupancy_df[occupancy_df['class_label_number'] == 10]
+    1. Filter the dataset to only include specimens that had a barcode found.
+    2. Compute the total area of the specimen bounding boxes. We call this A
+    3. Compute the total area of the specimen bounding boxes with the barcode removed. 
+    This will be A0
+    4. Compute percentage difference: (A0-A)/A0. [E.g., if the area excluding the barcode was 50, 
+    and the area including the barcode was 55, you’d get 0.1 (a 10% increase).
+    """
+    # Update class_label_number: Change 0 and 2 to 10
+    occupancy_df.loc[occupancy_df['class_label_number'].isin([0, 2]), 'class_label_number'] = 10
+    occupancy_bboxes = occupancy_df[occupancy_df['class_label_number'] == 10]
+    barcode_bboxes = occupancy_df[occupancy_df['class_label_number'] == 1]
 
-aim2_results = process_specimens_and_barcodes(occupancy_bboxes, barcode_bboxes)
-aim2_bounding_boxes = [result['larger_bbox'] for result in aim2_results]
-aim2_specimen_bboxes = [result['specimen_bbox'] for result in aim2_results]
-aim2_specimen_bboxes = pd.DataFrame(aim2_specimen_bboxes)
-aim2_bounding_boxes_df = convert_to_dataframe(aim2_bounding_boxes, 11)
+    aim2_results, unpaired_occupancy = process_specimens_and_barcodes(occupancy_bboxes, barcode_bboxes)
 
-aim2_A0 = compute_total_non_overlapping_area(aim2_bounding_boxes_df, image_width, image_height)
-aim2_A = compute_total_non_overlapping_area(aim2_specimen_bboxes, image_width, image_height)
+    # Extract required values
+    aim2_bounding_boxes = [result['larger_bbox'] for result in aim2_results]
+    aim2_specimen_bboxes = [result['specimen_bbox'] for result in aim2_results]
+    # Convert specimen_bboxes to DataFrame
+    aim2_specimen_bboxes = pd.DataFrame(aim2_specimen_bboxes)
+    aim2_bounding_boxes_df = convert_to_dataframe(aim2_bounding_boxes, 11)
 
-# Merge all DataFrames
-aim2_df = pd.concat([aim2_specimen_bboxes, aim2_bounding_boxes_df], ignore_index=True)
-"""
-print("Number of occupancy: ", len(occupancy_bboxes))
-print("Number of aim2 bounding boxes: ", len(aim2_bounding_boxes))
-print("Number of filtered_occupancy_df boxes: ", len(aim2_specimen_bboxes))
-print("Total non-overlapping area: ", (aim2_A0 - aim2_A)/aim2_A)
-"""
-# Save as CSV
-aim2_df.to_csv("aim2_results.csv", index=False)
+    # Extract areas
+    specimen_areas = [result['specimen_area']*image_width*image_height for result in aim2_results]
+    larger_bbox_areas = [result['larger_bbox_area']*image_width*image_height for result in aim2_results]
 
-# Aim 3: Calculate mean occupancy of unit trays
-unit_tray_bboxes = bboxes[bboxes['class_label_number'] == 5]
-unit_tray_occupancy_df = analyze_unit_tray_occupancy(occupancy_df, unit_tray_bboxes, image_width, image_height)
-# Merge unit tray occupancy info with unit_tray_bboxes
-unit_tray_bboxes = unit_tray_bboxes.reset_index()
-merged_unit_trays_df = unit_tray_bboxes.merge(
-    unit_tray_occupancy_df, 
-    left_index=True, 
-    right_on="unit_tray_index", 
-    how="left"
-).drop(columns=["unit_tray_index"])  # Remove redundant index column
-merged_unit_trays_df = merged_unit_trays_df.set_index("index")
-# Merge all DataFrames
-drawer_bboxes = pd.DataFrame(drawer_bboxes)
-aim3_df = pd.concat([occupancy_df, drawer_bboxes, merged_unit_trays_df], ignore_index=True)
-# Save as CSV
-aim3_df.to_csv("aim3_results.csv", index=False)
-"""
-# Display results
-print("Analyze unit tray occupancy: ")
-print(merged_unit_trays_df)
-"""
+    # Add new columns
+    aim2_specimen_bboxes['specimen_area'] = specimen_areas
+    aim2_specimen_bboxes['specimen_area_with_barcode'] = larger_bbox_areas
+    aim2_specimen_bboxes['has_barcode'] = True
 
-"""
-# Draw bounding boxes and overlay total area
-image_with_bboxes = draw_bounding_boxes(image, occupancy_df, total_area, image_width, image_height)
+    aim2_bounding_boxes_df['specimen_area'] = specimen_areas
+    aim2_bounding_boxes_df['specimen_area_with_barcode'] = larger_bbox_areas
+    aim2_bounding_boxes_df['has_barcode'] = True
 
-# Draw each bounding box on the image
-for index, bbox in drawer_bboxes.iterrows():
-    # Denormalize the coordinates
-    x_min = int(bbox['normalized_top_left_x'] * image_width)
-    y_min = int(bbox['normalized_top_left_y'] * image_height)
-    x_max = int(bbox['normalized_bottom_right_x'] * image_width)
-    y_max = int(bbox['normalized_bottom_right_y'] * image_height)
-    # Draw the rectangle
-    cv2.rectangle(image_with_bboxes, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)  # Green box with thickness 2
+    aim2_A0 = compute_total_non_overlapping_area(aim2_bounding_boxes_df, image_width, image_height)
+    aim2_A = compute_total_non_overlapping_area(aim2_specimen_bboxes, image_width, image_height)
+    aim2_unpaired_occupancy_area = compute_total_non_overlapping_area(unpaired_occupancy, image_width, image_height)
 
-for index, bbox in unit_tray_bboxes.iterrows():
-    # Denormalize the coordinates
-    x_min = int(bbox['normalized_top_left_x'] * image_width)
-    y_min = int(bbox['normalized_top_left_y'] * image_height)
-    x_max = int(bbox['normalized_bottom_right_x'] * image_width)
-    y_max = int(bbox['normalized_bottom_right_y'] * image_height)
-    # Draw the rectangle
-    cv2.rectangle(image_with_bboxes, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)  # Green box with thickness 2
+    # Merge all DataFrames
+    if unpaired_occupancy is None or unpaired_occupancy.empty:
+        aim2_unpaired_occupancy_df = pd.DataFrame(columns=aim2_specimen_bboxes.columns)
+    else:
+        aim2_unpaired_occupancy_df = pd.DataFrame(unpaired_occupancy)
+        aim2_unpaired_occupancy_df['class_label_number'] = 12  # Assign label
+        aim2_unpaired_occupancy_df['specimen_area'] = aim2_unpaired_occupancy_df.apply(
+            lambda row: compute_area_box(row, image_width, image_height), axis=1
+        )
+        aim2_unpaired_occupancy_df['has_barcode'] = False
 
-# Draw each bounding box on the image
-for index, bbox in aim2_bounding_boxes_df.iterrows():
-    # Denormalize the coordinates
-    x_min = int(bbox['normalized_top_left_x'] * image_width)
-    y_min = int(bbox['normalized_top_left_y'] * image_height)
-    x_max = int(bbox['normalized_bottom_right_x'] * image_width)
-    y_max = int(bbox['normalized_bottom_right_y'] * image_height)
-    # Draw the rectangle
-    cv2.rectangle(image_with_bboxes, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)  # Green box with thickness 2
+    # print("specimen_areas[0]: ", aim2_bounding_boxes_df.iloc[0])
+    # print("larger_bbox_areas[0]: ", aim2_unpaired_occupancy_df.iloc[0])
 
+    aim2_df = pd.concat([aim2_specimen_bboxes, aim2_bounding_boxes_df, aim2_unpaired_occupancy_df], ignore_index=True)
 
-# Show the final image
-cv2.imshow("Bounding Boxes with Total Area", image_with_bboxes)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
-"""
-# Visualize the merged polygon
-# visualize_merged_polygon(merged_df, image_width, image_height)
+    # Prevent division by zero in aim2_expansion_percentage
+    if aim2_A == 0:
+        aim2_expansion_percentage = 0
+    else:
+        aim2_expansion_percentage = (aim2_A0 - aim2_A) / aim2_A
+    
+    is_rehoused_boolean = is_rehoused(occupancy_df)
 
-# Optionally, save the image with bounding boxes
-"""
-output_path = "output_image_with_boxes.jpg"
-cv2.imwrite(output_path, image)
-print(f"Image saved to {output_path}")
-"""
+    """
+    # Display the detection details
+    print("Number of occupancy: ", len(occupancy_bboxes))
+    print("Number of barcodes: ", len(barcode_bboxes))
+    print("Number of aim2 bounding boxes: ", len(aim2_bounding_boxes))
+    print("Number of filtered_occupancy_df boxes: ", len(aim2_specimen_bboxes))
+    print("Total expansion percentage difference: ", aim2_expansion_percentage)
+    print("Total unpaired occupancy area: ", aim2_unpaired_occupancy_area)
+    print("Total aim2_A0: ", aim2_A0)
+    print("Total aim2_A: ", aim2_A)
+    """
+
+    return aim2_df, aim2_expansion_percentage, aim2_unpaired_occupancy_area, is_rehoused_boolean
+
+def run_aim3(occupancy_df, unit_tray_bboxes, image_width, image_height):
+    """
+    Aim 3: Calculate mean occupancy of unit trays
+
+    1. For each grade of unit tray, A, B, C, D, E: Filter unit trays for being full
+    2. Calculate specimen area of unit tray
+    3. Calculate mean across unit trays in same grade
+    (Let this be UA, UB, UC, UD, UE)
+    """
+    # Aim 3: Calculate mean occupancy of unit trays
+    # unit_tray_occupancy_df = analyze_unit_tray_occupancy(occupancy_df, unit_tray_bboxes, image_width, image_height)
+    aim3_df, unit_tray_occupancy_df = analyse_unit_tray_occupancy_optimised(occupancy_df, unit_tray_bboxes, image_width, image_height)
+    
+    # Merge unit tray occupancy info with unit_tray_bboxes
+    unit_tray_bboxes = unit_tray_bboxes.reset_index()
+    merged_unit_trays_df = unit_tray_bboxes.merge(
+        unit_tray_occupancy_df, 
+        left_index=True, 
+        right_on="unit_tray_index", 
+        how="left"
+    ).drop(columns=["unit_tray_index"])  # Remove redundant index column
+    merged_unit_trays_df = merged_unit_trays_df.set_index("index")
+    
+    # Display results
+    # print("Analyze unit tray occupancy: ")
+    # print(merged_unit_trays_df)
+
+    # Merge all DataFrames
+    # aim3_df = pd.concat([occupancy_df, merged_unit_trays_df], ignore_index=True)
+
+    return aim3_df, merged_unit_trays_df
+
+def run_all(image_path, csv_path):
+    """
+    Run all three aims on the given image and CSV file.
+
+    Parameters:
+    - image_path: Path to the image file.
+    - csv_path: Path to the CSV file containing bounding box information.
+    """
+    # Load the original image
+    image = cv2.imread(image_path)
+    # Check if the image was loaded successfully
+    if image is None:
+        raise FileNotFoundError(f"Image not found at {image_path}")
+
+    # Get the image's width and height
+    image_height, image_width, _ = image.shape  # _ is the number of color channels (ignored)
+
+    # Load the bounding boxes from the CSV file
+    bboxes = pd.read_csv(csv_path)
+    drawer_bboxes = bboxes[bboxes['class_label_number'] == 4]
+    drawer_area_normalised = compute_area(drawer_bboxes.iloc[0])
+    print("Drawer area normalised: ", drawer_area_normalised)
+
+    # Aim 1: Current occupancy estimate
+    occupancy_df, total_area, unit_tray_bboxes = run_aim1(bboxes, image_width, image_height)
+    print("Total non-overlapping area: ", total_area)
+
+    # Aim 2: Specimen expansion with barcode
+    aim2_df, aim2_expansion_percentage, aim2_unpaired_occupancy_area, is_rehoused_boolean = run_aim2(occupancy_df, image_width, image_height)
+    print("Expansion percentage: ", aim2_expansion_percentage)
+    print("Total unpaired occupancy area: ", aim2_unpaired_occupancy_area)
+    print("This drawer is rehoused:", is_rehoused_boolean)
+    aim2_results = aim2_df[aim2_df['class_label_number'].isin([11, 12])]
+
+    # a, b = compute_occupancy_areas(aim2_df, image_width, image_height)
+    # print("Total non-overlapping area: ", a)
+
+    # Save as CSV
+    # aim2_df.to_csv("aim2_results.csv", index=False)
+
+    # Aim 3: Calculate mean occupancy of unit trays
+    unit_tray_bboxes = pd.read_csv(unit_tray_path)
+    if len(unit_tray_bboxes) > 0:
+        aim3_df, aim3_unit_trays_df = run_aim3(aim2_results, unit_tray_bboxes, image_width, image_height)
+    print(aim3_df.head())
+    print(aim3_unit_trays_df.head())
+    # Save as CSV
+    # aim3_df.to_csv("aim3_results.csv", index=False)
+
+    # Merge all DataFrames
+    drawer_bboxes = pd.DataFrame(drawer_bboxes)
+    result = pd.concat([aim3_df, drawer_bboxes], ignore_index=True)
+
+    # Draw bounding boxes and overlay total area
+    image_with_bboxes = draw_bounding_boxes(image, occupancy_df, total_area, image_width, image_height)
+
+    # Draw each bounding box on the image
+    for index, bbox in drawer_bboxes.iterrows():
+        # Denormalize the coordinates
+        x_min = int(bbox['normalized_top_left_x'] * image_width)
+        y_min = int(bbox['normalized_top_left_y'] * image_height)
+        x_max = int(bbox['normalized_bottom_right_x'] * image_width)
+        y_max = int(bbox['normalized_bottom_right_y'] * image_height)
+        # Draw the rectangle
+        cv2.rectangle(image_with_bboxes, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)  # Green box with thickness 2
+    """
+    # Draw the average drawer
+    avg_drawer = pd.read_csv(drawer_averages_path)
+    for index, bbox in avg_drawer.iterrows():
+        # Denormalize the coordinates
+        x_min = int(bbox['normalized_top_left_x'] * image_width)
+        y_min = int(bbox['normalized_top_left_y'] * image_height)
+        x_max = int(bbox['normalized_bottom_right_x'] * image_width)
+        y_max = int(bbox['normalized_bottom_right_y'] * image_height)
+        # Draw the rectangle
+        cv2.rectangle(image_with_bboxes, (x_min, y_min), (x_max, y_max), (255, 255, 0), 2)  # Green box with thickness 2
+    """
+    for index, bbox in unit_tray_bboxes.iterrows():
+        # Denormalize the coordinates
+        x_min = int(bbox['normalized_top_left_x'] * image_width)
+        y_min = int(bbox['normalized_top_left_y'] * image_height)
+        x_max = int(bbox['normalized_bottom_right_x'] * image_width)
+        y_max = int(bbox['normalized_bottom_right_y'] * image_height)
+        # Draw the rectangle
+        cv2.rectangle(image_with_bboxes, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)  # Green box with thickness 2
+
+    # Draw each bounding box on the image
+    aim2_bounding_boxes = aim2_df[aim2_df['class_label_number'] == 11]
+    for index, bbox in aim2_bounding_boxes.iterrows():
+        # Denormalize the coordinates
+        x_min = int(bbox['normalized_top_left_x'] * image_width)
+        y_min = int(bbox['normalized_top_left_y'] * image_height)
+        x_max = int(bbox['normalized_bottom_right_x'] * image_width)
+        y_max = int(bbox['normalized_bottom_right_y'] * image_height)
+        # Draw the rectangle
+        cv2.rectangle(image_with_bboxes, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)  # Green box with thickness 2
+    # Display the total area on the image
+    text = f"Average expansion percentage for individual specimen with barcode: {aim2_expansion_percentage:.2f}"
+    cv2.putText(image_with_bboxes, text, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # Show the final image
+    cv2.imshow("Bounding Boxes with Total Area", image_with_bboxes)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    # Visualize the merged polygon
+    # visualize_merged_polygon(merged_df, image_width, image_height)
+    
+    # Optionally, save the image with bounding boxes
+    output_path = "/Users/mbax9qg2/Downloads/output_image_with_boxes.jpg"
+    cv2.imwrite(output_path, image_with_bboxes)
+    print(f"Image saved to {output_path}")
+    """"""
+
+# Define the image and CSV paths, replace with your image path
+image_path = '/Users/mbax9qg2/Downloads/training_data/source/014533675_final.2500x13036.jpeg'
+csv_path = '/Users/mbax9qg2/Downloads/processed/014533675_final.2500x13036.csv'
+# Define the drawer averages path if nessary
+drawer_averages_path = '/Users/mbax9qg2/Downloads/drawer/drawer_averages.csv'
+unit_tray_path = '/Users/mbax9qg2/Downloads/drawer/014533675_final.2500x13036.csv'
+run_all(image_path, csv_path)
